@@ -1,0 +1,10 @@
+backend/storage/*.tif
+backend/storage/*.img
+backend/storage/**/
+backend/.venv/
+__pycache__/
+*.pyc
+frontend/node_modules/
+frontend/dist/
+.DS_Store
+.claude/settings.local.json
