@@ -19,6 +19,7 @@ class LatLng(BaseModel):
 class RouteRequest(BaseModel):
     waypoints: list[LatLng]
     road_width_m: float = DEFAULT_ROAD_WIDTH_M
+    seed: int | None = None
 
 STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage"
 STORAGE_DIR.mkdir(exist_ok=True)
@@ -106,9 +107,11 @@ async def dem_route(dem_id: str, req: RouteRequest):
 
     waypoints = [(wp.lng, wp.lat) for wp in req.waypoints]
     try:
-        result = find_multi_route(dem, waypoints)
+        result = find_multi_route(dem, waypoints, req.seed)
     except RouteError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    result["earthwork"] = estimate_earthwork(dem, result["path"], result["profile"], req.road_width_m)
+    result["earthwork"] = estimate_earthwork(
+        dem, result["path"], result["profile"], req.road_width_m, result["crossings"]
+    )
     return result

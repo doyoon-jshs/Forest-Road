@@ -27,23 +27,31 @@ SIMPLIFY_EPSILON_CELLS = 1.5
 CHAIKIN_ITERATIONS = 3
 MIN_CURVE_RADIUS_M = 15.0  # 임도 설계기준 최소곡선반경(근사)
 
+SEED_NOISE_RANGE = 0.15  # 시드가 주어지면 비용표면에 ±15% 랜덤 노이즈를 섞어 대안 노선을 유도
+
 
 class RouteError(Exception):
     pass
 
 
-def find_route(dem, start_lonlat: tuple[float, float], end_lonlat: tuple[float, float]) -> dict:
-    surface = _prepare_cost_surface(dem)
+def find_route(
+    dem, start_lonlat: tuple[float, float], end_lonlat: tuple[float, float], seed: int | None = None
+) -> dict:
+    surface = _prepare_cost_surface(dem, seed)
     return _route_segment(surface, start_lonlat, end_lonlat, "시작점", "도착점")
 
 
-def find_multi_route(dem, waypoints: list[tuple[float, float]]) -> dict:
+def find_multi_route(dem, waypoints: list[tuple[float, float]], seed: int | None = None) -> dict:
     """waypoints를 순서대로 지나는 다구간 노선. 시작점/도착점 사이에 경유지를 몇 개든 넣을 수 있음.
-    비용표면(경사·계곡 유역면적 등)은 전체 DEM에 대해 한 번만 계산해 각 구간에서 재사용한다."""
+    비용표면(경사·계곡 유역면적 등)은 전체 DEM에 대해 한 번만 계산해 각 구간에서 재사용한다.
+
+    seed를 주면 비용표면에 그 시드로 생성한 랜덤 노이즈를 섞는다 - 하드 제약(통행 불가)은 그대로
+    유지되면서, 비슷한 비용의 대안 경로 중 하나로 결과가 갈릴 수 있다. 같은 시드는 항상 같은 노선을
+    준다(결정론적)."""
     if len(waypoints) < 2:
         raise RouteError("경유지를 포함해 최소 2개 지점이 필요합니다.")
 
-    surface = _prepare_cost_surface(dem)
+    surface = _prepare_cost_surface(dem, seed)
 
     combined_path: list[dict] = []
     combined_profile: list[dict] = []
@@ -70,7 +78,14 @@ def find_multi_route(dem, waypoints: list[tuple[float, float]]) -> dict:
                 {**p, "distance_m": p["distance_m"] + distance_offset} for p in seg_profile[1:]
             )
 
-        crossings.extend(segment["crossings"])
+        crossings.extend(
+            {
+                **c,
+                "start_distance_m": c["start_distance_m"] + distance_offset,
+                "end_distance_m": c["end_distance_m"] + distance_offset,
+            }
+            for c in segment["crossings"]
+        )
         tight_curves.extend(
             {**c, "distance_m": c["distance_m"] + distance_offset} for c in segment["tight_curves"]
         )
@@ -95,21 +110,34 @@ def find_multi_route(dem, waypoints: list[tuple[float, float]]) -> dict:
     }
 
 
-def _prepare_cost_surface(dem) -> dict:
+def _apply_seed_noise(cost: np.ndarray, seed: int) -> np.ndarray:
+    """하드 제약(통행 불가, cost=inf)은 그대로 두고, 나머지 셀의 비용에만 ±SEED_NOISE_RANGE
+    만큼 시드 기반 랜덤 배율을 곱한다. 같은 seed는 항상 같은 노이즈 → 같은 노선(재현 가능)."""
+    rng = np.random.default_rng(seed)
+    noise = rng.uniform(1.0 - SEED_NOISE_RANGE, 1.0 + SEED_NOISE_RANGE, size=cost.shape)
+    return np.where(np.isfinite(cost), cost * noise, cost)
+
+
+def _prepare_cost_surface(dem, seed: int | None = None) -> dict:
     elevation, transform, valid = _downsampled_grid(dem, MAX_ROUTING_DIM)
     cellsize = abs(transform.a)
     land = _land_mask(elevation, valid)
 
     slope_percent = _slope_percent(elevation, cellsize)
     accumulation = _flow_accumulation(elevation)
+    is_valley_shape = _local_concavity(elevation) > 0
     culvert_threshold, bridge_threshold = _stream_thresholds(accumulation, land)
-    cost = _cost_surface(slope_percent, land, accumulation, culvert_threshold, bridge_threshold)
+    cost = _cost_surface(slope_percent, land, accumulation, is_valley_shape, culvert_threshold, bridge_threshold)
+
+    if seed is not None:
+        cost = _apply_seed_noise(cost, seed)
 
     return {
         "transform": transform,
         "elevation": elevation,
         "cost": cost,
         "accumulation": accumulation,
+        "is_valley_shape": is_valley_shape,
         "culvert_threshold": culvert_threshold,
         "bridge_threshold": bridge_threshold,
     }
@@ -150,6 +178,7 @@ def _route_segment(
         transform,
         surface["elevation"],
         surface["accumulation"],
+        surface["is_valley_shape"],
         surface["culvert_threshold"],
         surface["bridge_threshold"],
     )
@@ -304,6 +333,19 @@ def _flow_accumulation(elevation: np.ndarray) -> np.ndarray:
     return accumulation.reshape(height, width)
 
 
+def _local_concavity(elevation: np.ndarray) -> np.ndarray:
+    """중심 셀이 상하좌우 이웃 평균보다 얼마나 낮은지(양수 = 오목 = 계곡 형태).
+    D8 흐름누적은 완전히 평탄한 지형에서도 방향 결정의 tie 때문에 특정 셀에 유량이
+    쏠리는 아티팩트를 만들 수 있는데, 그런 셀은 실제로는 오목하지 않다 - 이 값으로 걸러낸다."""
+    return (
+        np.roll(elevation, 1, axis=0)
+        + np.roll(elevation, -1, axis=0)
+        + np.roll(elevation, 1, axis=1)
+        + np.roll(elevation, -1, axis=1)
+        - 4 * elevation
+    )
+
+
 def _stream_thresholds(accumulation: np.ndarray, valid: np.ndarray) -> tuple[float, float]:
     land_values = accumulation[valid]
     culvert = float(np.percentile(land_values, CULVERT_PERCENTILE))
@@ -311,11 +353,13 @@ def _stream_thresholds(accumulation: np.ndarray, valid: np.ndarray) -> tuple[flo
     return culvert, bridge
 
 
-def _crossing_cost(accumulation: np.ndarray, culvert_threshold: float, bridge_threshold: float) -> np.ndarray:
+def _crossing_cost(
+    accumulation: np.ndarray, is_valley_shape: np.ndarray, culvert_threshold: float, bridge_threshold: float
+) -> np.ndarray:
     cost = np.zeros_like(accumulation)
 
-    culvert_mask = (accumulation >= culvert_threshold) & (accumulation < bridge_threshold)
-    bridge_mask = accumulation >= bridge_threshold
+    culvert_mask = is_valley_shape & (accumulation >= culvert_threshold) & (accumulation < bridge_threshold)
+    bridge_mask = is_valley_shape & (accumulation >= bridge_threshold)
 
     cost[culvert_mask] = CULVERT_BASE_COST * (accumulation[culvert_mask] / culvert_threshold)
     cost[bridge_mask] = BRIDGE_BASE_COST * (accumulation[bridge_mask] / bridge_threshold)
@@ -326,6 +370,7 @@ def _cost_surface(
     slope_percent: np.ndarray,
     land: np.ndarray,
     accumulation: np.ndarray,
+    is_valley_shape: np.ndarray,
     culvert_threshold: float,
     bridge_threshold: float,
 ) -> np.ndarray:
@@ -334,7 +379,7 @@ def _cost_surface(
         (slope_percent / MAX_GRADE_PERCENT) ** 2,
         1.0 + 20.0 * (slope_percent - MAX_GRADE_PERCENT),
     )
-    crossing_penalty = _crossing_cost(accumulation, culvert_threshold, bridge_threshold)
+    crossing_penalty = _crossing_cost(accumulation, is_valley_shape, culvert_threshold, bridge_threshold)
 
     cost = 1.0 + grade_penalty + crossing_penalty
     cost[slope_percent > ABSOLUTE_MAX_GRADE_PERCENT] = np.inf
@@ -358,9 +403,13 @@ def _validate_rc(rc: tuple[int, int], cost: np.ndarray, label: str) -> None:
 
 
 def _summarize_crossings(
-    distances: np.ndarray, accumulation_values: np.ndarray, culvert_threshold: float, bridge_threshold: float
+    distances: np.ndarray,
+    accumulation_values: np.ndarray,
+    valley_shape_values: np.ndarray,
+    culvert_threshold: float,
+    bridge_threshold: float,
 ) -> list[dict]:
-    stream_mask = accumulation_values >= culvert_threshold
+    stream_mask = (accumulation_values >= culvert_threshold) & (valley_shape_values > 0.5)
     crossings = []
     i = 0
     n = len(distances)
@@ -372,7 +421,14 @@ def _summarize_crossings(
                 peak = max(peak, accumulation_values[j])
                 j += 1
             structure = "교량" if peak >= bridge_threshold else "암거"
-            crossings.append({"structure": structure, "relative_catchment": float(peak / culvert_threshold)})
+            crossings.append(
+                {
+                    "structure": structure,
+                    "relative_catchment": float(peak / culvert_threshold),
+                    "start_distance_m": float(distances[i]),
+                    "end_distance_m": float(distances[j - 1]),
+                }
+            )
             i = j
         else:
             i += 1
@@ -385,6 +441,7 @@ def _build_result(
     transform,
     elevation: np.ndarray,
     accumulation: np.ndarray,
+    is_valley_shape: np.ndarray,
     culvert_threshold: float,
     bridge_threshold: float,
 ) -> dict:
@@ -398,6 +455,7 @@ def _build_result(
     coords = np.stack([rows, cols])
     elevations = map_coordinates(elevation, coords, order=1, mode="nearest")
     accumulation_values = map_coordinates(accumulation, coords, order=1, mode="nearest")
+    valley_shape_values = map_coordinates(is_valley_shape.astype(np.float64), coords, order=1, mode="nearest")
 
     seg_dist = np.sqrt(np.diff(xs) ** 2 + np.diff(ys) ** 2)
     cum_dist = np.concatenate([[0.0], np.cumsum(seg_dist)])
@@ -406,7 +464,7 @@ def _build_result(
     nonzero = seg_dist > 0
     grades[1:][nonzero] = np.abs(np.diff(elevations)[nonzero]) / seg_dist[nonzero] * 100.0
 
-    crossings = _summarize_crossings(cum_dist, accumulation_values, culvert_threshold, bridge_threshold)
+    crossings = _summarize_crossings(cum_dist, accumulation_values, valley_shape_values, culvert_threshold, bridge_threshold)
 
     radii = _curve_radii(xs, ys)
     min_radius = float(np.min(radii)) if len(radii) else None

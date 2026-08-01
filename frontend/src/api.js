@@ -43,11 +43,11 @@ export async function fetchElevation(demId, lat, lng) {
   return res.json();
 }
 
-export async function findRoute(demId, waypoints, roadWidthM) {
+export async function findRoute(demId, waypoints, roadWidthM, seed) {
   const res = await fetch(`${API_BASE}/dem/${demId}/route`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ waypoints, road_width_m: roadWidthM }),
+    body: JSON.stringify({ waypoints, road_width_m: roadWidthM, seed }),
   });
 
   if (!res.ok) {

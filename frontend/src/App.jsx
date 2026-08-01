@@ -4,6 +4,28 @@ import { useEffect, useRef, useState } from "react";
 import "./App.css";
 import { elevationHeatmapUrl, fetchContours, fetchElevation, findRoute, hillshadeUrl, slopeUrl, uploadDem } from "./api";
 import ElevationProfile from "./ElevationProfile";
+import { combinedGeoJSON, downloadText, routeToCSV, routeToGeoJSON } from "./export";
+
+const ROUTE_COLORS = ["#1f6feb", "#e65100", "#2e7d32", "#ad1457", "#6a1b9a", "#00838f", "#8d6e63"];
+const BRIDGE_COLOR = "#6a1b9a";
+
+function getBridgeSegments(result) {
+  const bridges = (result.crossings || []).filter((c) => c.structure === "교량");
+  if (bridges.length === 0 || !result.profile || !result.path) return [];
+
+  const segments = [];
+  bridges.forEach((bridge) => {
+    const points = [];
+    result.profile.forEach((p, i) => {
+      if (p.distance_m >= bridge.start_distance_m && p.distance_m <= bridge.end_distance_m) {
+        const pt = result.path[i];
+        if (pt) points.push([pt.lat, pt.lng]);
+      }
+    });
+    if (points.length >= 2) segments.push(points);
+  });
+  return segments;
+}
 
 export default function App() {
   const mapContainerRef = useRef(null);
@@ -11,6 +33,7 @@ export default function App() {
   const overlayRef = useRef(null);
   const markersLayerRef = useRef(null);
   const routeLayerRef = useRef(null);
+  const savedRoutesLayerRef = useRef(null);
   const contoursLayerRef = useRef(null);
   const contoursDataRef = useRef(null);
   const hoverTimeoutRef = useRef(null);
@@ -26,6 +49,9 @@ export default function App() {
   const [routeResult, setRouteResult] = useState(null);
   const [routeStatus, setRouteStatus] = useState("");
   const [roadWidthM, setRoadWidthM] = useState(4);
+  const [savedRoutes, setSavedRoutes] = useState([]);
+  const [routeSeed, setRouteSeed] = useState(null);
+  const [profileHeight, setProfileHeight] = useState(220);
 
   useEffect(() => {
     mapRef.current = L.map(mapContainerRef.current).setView([33.38, 126.55], 11);
@@ -34,6 +60,7 @@ export default function App() {
     }).addTo(mapRef.current);
     markersLayerRef.current = L.layerGroup().addTo(mapRef.current);
     routeLayerRef.current = L.layerGroup().addTo(mapRef.current);
+    savedRoutesLayerRef.current = L.layerGroup().addTo(mapRef.current);
 
     return () => mapRef.current?.remove();
   }, []);
@@ -161,29 +188,42 @@ export default function App() {
     }
 
     setRouteStatus("노선 탐색 중...");
-    findRoute(demInfo.dem_id, routePoints, roadWidthM)
+    findRoute(demInfo.dem_id, routePoints, roadWidthM, routeSeed)
       .then((result) => {
         setRouteResult(result);
-        const ew = result.earthwork;
         const curveWarning =
           result.tight_curves && result.tight_curves.length > 0
-            ? ` / 최소곡선반경 ${result.min_curve_radius_m.toFixed(0)}m (기준 미달 ${result.tight_curves.length}곳)`
+            ? `최소곡선반경 ${result.min_curve_radius_m.toFixed(0)}m (기준 미달 ${result.tight_curves.length}곳)`
             : "";
-        setRouteStatus(
-          `노선 길이 ${(result.length_m / 1000).toFixed(2)}km / 최대경사 ${result.max_grade_percent.toFixed(1)}%` +
-            (ew ? ` / 절토 ${(ew.cut_volume_m3 / 1000).toFixed(1)}천㎥ / 성토 ${(ew.fill_volume_m3 / 1000).toFixed(1)}천㎥` : "") +
-            curveWarning
-        );
+        const seedInfo = routeSeed != null ? `대안 시드 ${routeSeed}` : "";
+        setRouteStatus([curveWarning, seedInfo].filter(Boolean).join(" / "));
         const latlngs = result.path.map((p) => [p.lat, p.lng]);
         L.polyline(latlngs, { color: "#1f6feb", weight: 4 }).addTo(routeLayerRef.current);
+        getBridgeSegments(result).forEach((points) => {
+          L.polyline(points, { color: BRIDGE_COLOR, weight: 7, opacity: 0.9 }).addTo(routeLayerRef.current);
+        });
       })
       .catch((err) => setRouteStatus(`오류: ${err.message}`));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [routePoints, roadWidthM]);
+  }, [routePoints, roadWidthM, routeSeed]);
 
   useEffect(() => {
     mapRef.current?.invalidateSize();
   }, [routeResult]);
+
+  useEffect(() => {
+    const layer = savedRoutesLayerRef.current;
+    if (!layer) return;
+    layer.clearLayers();
+    savedRoutes.forEach((route) => {
+      if (!route.visible) return;
+      const latlngs = route.result.path.map((p) => [p.lat, p.lng]);
+      L.polyline(latlngs, { color: route.color, weight: 4, dashArray: "8 4" }).addTo(layer);
+      getBridgeSegments(route.result).forEach((points) => {
+        L.polyline(points, { color: BRIDGE_COLOR, weight: 7, opacity: 0.9 }).addTo(layer);
+      });
+    });
+  }, [savedRoutes]);
 
   async function handleFileChange(event) {
     const files = event.target.files;
@@ -203,10 +243,64 @@ export default function App() {
 
   function resetRoute() {
     setRoutePoints([]);
+    setRouteSeed(null);
+  }
+
+  function generateAlternativeRoute() {
+    setRouteSeed(Math.floor(Math.random() * 1_000_000_000));
+  }
+
+  function handleProfileDragStart(e) {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startHeight = profileHeight;
+    function onMove(ev) {
+      const delta = startY - ev.clientY;
+      setProfileHeight(Math.min(600, Math.max(100, startHeight + delta)));
+    }
+    function onUp() {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
   }
 
   function undoLastPoint() {
     setRoutePoints((prev) => prev.slice(0, -1));
+  }
+
+  function saveCurrentRoute() {
+    if (!routeResult) return;
+    const label = `노선 ${String.fromCharCode(65 + (savedRoutes.length % 26))}`;
+    const color = ROUTE_COLORS[savedRoutes.length % ROUTE_COLORS.length];
+    setSavedRoutes((prev) => [
+      ...prev,
+      { id: Date.now(), label, color, visible: true, roadWidthM, seed: routeSeed, result: routeResult },
+    ]);
+    setRoutePoints([]);
+    setRouteSeed(null);
+  }
+
+  function toggleRouteVisibility(id) {
+    setSavedRoutes((prev) => prev.map((r) => (r.id === id ? { ...r, visible: !r.visible } : r)));
+  }
+
+  function removeSavedRoute(id) {
+    setSavedRoutes((prev) => prev.filter((r) => r.id !== id));
+  }
+
+  function exportRoute(route, format) {
+    const safeLabel = route.label.replace(/\s+/g, "_");
+    if (format === "geojson") {
+      downloadText(`${safeLabel}.geojson`, JSON.stringify(routeToGeoJSON(route), null, 2), "application/geo+json");
+    } else {
+      downloadText(`${safeLabel}.csv`, routeToCSV(route), "text/csv");
+    }
+  }
+
+  function exportAllRoutes() {
+    downloadText("노선_비교.geojson", JSON.stringify(combinedGeoJSON(savedRoutes), null, 2), "application/geo+json");
   }
 
   useEffect(() => {
@@ -281,6 +375,25 @@ export default function App() {
           <button className="btn" onClick={resetRoute}>
             노선 초기화
           </button>
+          <button className="btn" onClick={saveCurrentRoute} disabled={!routeResult}>
+            이 노선 저장 (비교용)
+          </button>
+          <button className="btn" onClick={generateAlternativeRoute} disabled={routePoints.length < 2}>
+            다른 경로 생성
+          </button>
+          <label className="control-group">
+            시드
+            <input
+              type="number"
+              placeholder="랜덤"
+              value={routeSeed ?? ""}
+              onChange={(e) => {
+                const v = e.target.value;
+                setRouteSeed(v === "" ? null : Number(v));
+              }}
+              className="seed-input"
+            />
+          </label>
           <span className="hint">지도 클릭 = 지점 추가, 계속 클릭하면 경유지로 연결 (Ctrl/Cmd+Z로도 되돌리기)</span>
           <span className="route-status">{routeStatus}</span>
         </div>
@@ -327,16 +440,84 @@ export default function App() {
             <span>
               <span className="dot" style={{ background: "#c62828" }} /> 도착점
             </span>
+            {getBridgeSegments(routeResult || { path: [], profile: [], crossings: [] }).length > 0 && (
+              <span>
+                <span className="dot" style={{ background: BRIDGE_COLOR }} /> 교량
+              </span>
+            )}
+          </div>
+        )}
+        {savedRoutes.length > 0 && (
+          <div className="floating-panel compare-panel">
+            <div className="compare-header">
+              <span className="legend-title">노선 비교 ({savedRoutes.length})</span>
+              <button className="btn-mini" onClick={exportAllRoutes}>
+                전체 GeoJSON
+              </button>
+            </div>
+            <table className="compare-table">
+              <thead>
+                <tr>
+                  <th></th>
+                  <th>노선</th>
+                  <th>길이</th>
+                  <th>최대경사</th>
+                  <th>절토</th>
+                  <th>성토</th>
+                  <th>교량</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {savedRoutes.map((route) => {
+                  const ew = route.result.earthwork;
+                  return (
+                    <tr key={route.id} style={{ opacity: route.visible ? 1 : 0.4 }}>
+                      <td>
+                        <input
+                          type="checkbox"
+                          checked={route.visible}
+                          onChange={() => toggleRouteVisibility(route.id)}
+                        />
+                      </td>
+                      <td>
+                        <span className="dot" style={{ background: route.color }} /> {route.label}
+                      </td>
+                      <td>{(route.result.length_m / 1000).toFixed(2)}km</td>
+                      <td>{route.result.max_grade_percent.toFixed(1)}%</td>
+                      <td>{ew ? (ew.cut_volume_m3 / 1000).toFixed(1) : "-"}천㎥</td>
+                      <td>{ew ? (ew.fill_volume_m3 / 1000).toFixed(1) : "-"}천㎥</td>
+                      <td>{ew && ew.bridge_length_m > 0 ? `${ew.bridge_length_m.toFixed(0)}m` : "-"}</td>
+                      <td className="compare-actions">
+                        <button className="btn-mini" onClick={() => exportRoute(route, "geojson")} title="GeoJSON 내보내기">
+                          GeoJSON
+                        </button>
+                        <button className="btn-mini" onClick={() => exportRoute(route, "csv")} title="CSV 내보내기">
+                          CSV
+                        </button>
+                        <button className="btn-mini" onClick={() => removeSavedRoute(route.id)} title="삭제">
+                          ✕
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
         )}
       </div>
 
       {routeResult && (
-        <ElevationProfile
-          lengthM={routeResult.length_m}
-          maxGradePercent={routeResult.max_grade_percent}
-          earthwork={routeResult.earthwork}
-        />
+        <>
+          <div className="profile-resize-handle" onMouseDown={handleProfileDragStart} />
+          <ElevationProfile
+            lengthM={routeResult.length_m}
+            maxGradePercent={routeResult.max_grade_percent}
+            earthwork={routeResult.earthwork}
+            height={profileHeight}
+          />
+        </>
       )}
     </div>
   );

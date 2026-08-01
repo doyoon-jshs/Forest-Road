@@ -8,17 +8,25 @@ DEFAULT_ROAD_WIDTH_M = 4.0  # 임도 유효폭 근사치
 CUT_SLOPE_RATIO = 1.0  # 절토 사면 기울기 (수평:수직 = 1:1)
 FILL_SLOPE_RATIO = 1.5  # 성토 사면 기울기 (수평:수직 = 1.5:1)
 SAMPLE_INTERVAL_M = 10.0
+BRIDGE_STRUCTURE_LABEL = "교량"
 
 
 def estimate_earthwork(
-    dem, path: list[dict], profile: list[dict], road_width_m: float = DEFAULT_ROAD_WIDTH_M
+    dem,
+    path: list[dict],
+    profile: list[dict],
+    road_width_m: float = DEFAULT_ROAD_WIDTH_M,
+    crossings: list[dict] | None = None,
 ) -> dict:
     """경로의 station(=path/profile의 각 점)을 잇는 직선 구배를 설계 노면으로 보고,
     원본 해상도 DEM에서 촘촘히 재샘플링한 실제 지형고와 비교해 절/성토 단면적·물량을 추정한다.
 
     station 사이 간격(라우팅 격자 다운샘플링 때문에 보통 수백 m)보다 촘촘하게 지형을 다시
     읽는 이유는, 실제 도로는 station 사이를 직선으로 잇지만 지형은 그 사이에서도 오르내리기
-    때문 — station에서만 비교하면 그 굴곡이 전부 누락된다."""
+    때문 — station에서만 비교하면 그 굴곡이 전부 누락된다.
+
+    routing.py가 "교량"으로 분류한 구간은 흙을 쌓는 게 아니라 다리를 놓는 것이므로 성토 계산에서
+    제외하고, 대신 교량 총 길이로 따로 집계한다 (안 그러면 깊은 계곡이 비현실적인 성토량으로 잡힘)."""
 
     if len(profile) < 2:
         return _empty_result(road_width_m)
@@ -48,9 +56,22 @@ def estimate_earthwork(
     cut_area = road_width_m * cut_depth + CUT_SLOPE_RATIO * cut_depth**2
     fill_area = road_width_m * fill_depth + FILL_SLOPE_RATIO * fill_depth**2
 
+    bridge_spans = [
+        (c["start_distance_m"], c["end_distance_m"])
+        for c in (crossings or [])
+        if c.get("structure") == BRIDGE_STRUCTURE_LABEL
+    ]
+    in_bridge = np.zeros_like(sample_distances, dtype=bool)
+    for start, end in bridge_spans:
+        in_bridge |= (sample_distances >= start) & (sample_distances <= end)
+
+    cut_area = np.where(in_bridge, 0.0, cut_area)
+    fill_area = np.where(in_bridge, 0.0, fill_area)
+
     seg_len = np.diff(sample_distances)
     cut_volume = float(np.sum((cut_area[:-1] + cut_area[1:]) / 2 * seg_len))
     fill_volume = float(np.sum((fill_area[:-1] + fill_area[1:]) / 2 * seg_len))
+    bridge_length_m = float(sum(end - start for start, end in bridge_spans))
 
     sections = [
         {
@@ -59,13 +80,17 @@ def estimate_earthwork(
             "design_elevation_m": float(g),
             "cut_depth_m": float(c),
             "fill_depth_m": float(f),
+            "is_bridge": bool(b),
         }
-        for d, t, g, c, f in zip(sample_distances, terrain_at_samples, design_at_samples, cut_depth, fill_depth)
+        for d, t, g, c, f, b in zip(
+            sample_distances, terrain_at_samples, design_at_samples, cut_depth, fill_depth, in_bridge
+        )
     ]
 
     return {
         "cut_volume_m3": cut_volume,
         "fill_volume_m3": fill_volume,
+        "bridge_length_m": bridge_length_m,
         "road_width_m": road_width_m,
         "sections": sections,
     }
@@ -80,4 +105,10 @@ def _sample_elevations(dem, lons: np.ndarray, lats: np.ndarray) -> np.ndarray:
 
 
 def _empty_result(road_width_m: float) -> dict:
-    return {"cut_volume_m3": 0.0, "fill_volume_m3": 0.0, "road_width_m": road_width_m, "sections": []}
+    return {
+        "cut_volume_m3": 0.0,
+        "fill_volume_m3": 0.0,
+        "bridge_length_m": 0.0,
+        "road_width_m": road_width_m,
+        "sections": [],
+    }
