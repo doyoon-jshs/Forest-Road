@@ -13,6 +13,13 @@ export function routeToGeoJSON(route) {
           fill_volume_m3: route.result.earthwork?.fill_volume_m3 ?? null,
           bridge_length_m: route.result.earthwork?.bridge_length_m ?? null,
           road_width_m: route.roadWidthM,
+          seed: route.seed ?? null,
+          // 아래 필드들은 이 도구에서 다시 불러왔을 때(종단면도 포함) 완전히 복원하기 위한 것으로,
+          // 표준 GeoJSON 도구에서는 무시해도 되는 부가 데이터다.
+          profile: route.result.profile,
+          crossings: route.result.crossings,
+          tight_curves: route.result.tight_curves,
+          earthwork: route.result.earthwork ?? null,
         },
         geometry: {
           type: "LineString",
@@ -28,6 +35,31 @@ export function combinedGeoJSON(routes) {
     type: "FeatureCollection",
     features: routes.map((route) => routeToGeoJSON(route).features[0]),
   };
+}
+
+export function geoJSONToRoutes(geojson) {
+  const features = geojson.type === "FeatureCollection" ? geojson.features : [geojson];
+  return features
+    .filter((f) => f?.geometry?.type === "LineString" && Array.isArray(f.geometry.coordinates))
+    .map((f, i) => {
+      const props = f.properties || {};
+      const path = f.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }));
+      return {
+        label: props.label || `노선 ${i + 1}`,
+        roadWidthM: props.road_width_m ?? 4,
+        seed: props.seed ?? null,
+        result: {
+          path,
+          profile: props.profile || [],
+          length_m: props.length_m,
+          max_grade_percent: props.max_grade_percent,
+          crossings: props.crossings || [],
+          min_curve_radius_m: props.min_curve_radius_m ?? null,
+          tight_curves: props.tight_curves || [],
+          earthwork: props.earthwork ?? null,
+        },
+      };
+    });
 }
 
 export function routeToCSV(route) {

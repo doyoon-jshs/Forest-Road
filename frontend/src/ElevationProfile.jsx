@@ -10,7 +10,7 @@ function decimate(sections, targetCount) {
   return out;
 }
 
-export default function ElevationProfile({ lengthM, maxGradePercent, earthwork, height = 220 }) {
+export default function ElevationProfile({ lengthM, maxGradePercent, earthwork, height = 220, label }) {
   const svgWrapRef = useRef(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
 
@@ -88,7 +88,8 @@ export default function ElevationProfile({ lengthM, maxGradePercent, earthwork, 
       }}
     >
       <div style={{ fontSize: 13, marginBottom: 6, color: "#333", fontWeight: 500, flexShrink: 0 }}>
-        종단면도 — 거리 {(lengthM / 1000).toFixed(2)}km · 최대경사 {maxGradePercent.toFixed(1)}% · 절토{" "}
+        종단면도{label ? ` (${label})` : ""} — 거리 {(lengthM / 1000).toFixed(2)}km · 최대경사{" "}
+        {maxGradePercent.toFixed(1)}% · 절토{" "}
         {(earthwork.cut_volume_m3 / 1000).toFixed(1)}천㎥ · 성토 {(earthwork.fill_volume_m3 / 1000).toFixed(1)}천㎥
         {bridgeLengthM > 0 && ` · 교량 ${bridgeLengthM.toFixed(0)}m`}
         <span style={{ fontWeight: 400, color: "#777" }}> (도로폭 {earthwork.road_width_m}m 가정)</span>

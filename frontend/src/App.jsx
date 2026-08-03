@@ -4,10 +4,38 @@ import { useEffect, useRef, useState } from "react";
 import "./App.css";
 import { elevationHeatmapUrl, fetchContours, fetchElevation, findRoute, hillshadeUrl, slopeUrl, uploadDem } from "./api";
 import ElevationProfile from "./ElevationProfile";
-import { combinedGeoJSON, downloadText, routeToCSV, routeToGeoJSON } from "./export";
+import { combinedGeoJSON, downloadText, geoJSONToRoutes, routeToCSV, routeToGeoJSON } from "./export";
 
 const ROUTE_COLORS = ["#1f6feb", "#e65100", "#2e7d32", "#ad1457", "#6a1b9a", "#00838f", "#8d6e63"];
 const BRIDGE_COLOR = "#6a1b9a";
+
+const tightCurveIcon = L.divIcon({
+  className: "tight-curve-icon",
+  html: "⚠",
+  iconSize: [18, 18],
+  iconAnchor: [9, 9],
+});
+
+function getTightCurvePoints(result) {
+  const curves = result.tight_curves || [];
+  if (curves.length === 0 || !result.profile || !result.path) return [];
+
+  return curves
+    .map((tc) => {
+      let bestIdx = 0;
+      let bestDiff = Infinity;
+      result.profile.forEach((p, i) => {
+        const diff = Math.abs(p.distance_m - tc.distance_m);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestIdx = i;
+        }
+      });
+      const pt = result.path[bestIdx];
+      return pt ? { lat: pt.lat, lng: pt.lng, radius_m: tc.radius_m, distance_m: tc.distance_m } : null;
+    })
+    .filter(Boolean);
+}
 
 function getBridgeSegments(result) {
   const bridges = (result.crossings || []).filter((c) => c.structure === "교량");
@@ -52,6 +80,7 @@ export default function App() {
   const [savedRoutes, setSavedRoutes] = useState([]);
   const [routeSeed, setRouteSeed] = useState(null);
   const [profileHeight, setProfileHeight] = useState(220);
+  const [selectedRouteId, setSelectedRouteId] = useState(null);
 
   useEffect(() => {
     mapRef.current = L.map(mapContainerRef.current).setView([33.38, 126.55], 11);
@@ -202,6 +231,11 @@ export default function App() {
         getBridgeSegments(result).forEach((points) => {
           L.polyline(points, { color: BRIDGE_COLOR, weight: 7, opacity: 0.9 }).addTo(routeLayerRef.current);
         });
+        getTightCurvePoints(result).forEach((tc) => {
+          L.marker([tc.lat, tc.lng], { icon: tightCurveIcon })
+            .bindTooltip(`급커브 반경 ${tc.radius_m.toFixed(1)}m (기준 15m 미달)`)
+            .addTo(routeLayerRef.current);
+        });
       })
       .catch((err) => setRouteStatus(`오류: ${err.message}`));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -221,6 +255,11 @@ export default function App() {
       L.polyline(latlngs, { color: route.color, weight: 4, dashArray: "8 4" }).addTo(layer);
       getBridgeSegments(route.result).forEach((points) => {
         L.polyline(points, { color: BRIDGE_COLOR, weight: 7, opacity: 0.9 }).addTo(layer);
+      });
+      getTightCurvePoints(route.result).forEach((tc) => {
+        L.marker([tc.lat, tc.lng], { icon: tightCurveIcon })
+          .bindTooltip(`급커브 반경 ${tc.radius_m.toFixed(1)}m (기준 15m 미달) — ${route.label}`)
+          .addTo(layer);
       });
     });
   }, [savedRoutes]);
@@ -244,6 +283,34 @@ export default function App() {
   function resetRoute() {
     setRoutePoints([]);
     setRouteSeed(null);
+    setSelectedRouteId(null);
+  }
+
+  async function handleGeoJSONImport(event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    try {
+      const geojson = JSON.parse(await file.text());
+      const imported = geoJSONToRoutes(geojson);
+      if (imported.length === 0) {
+        setStatus("오류: 가져올 노선(LineString)이 파일에 없습니다.");
+        return;
+      }
+      setSavedRoutes((prev) => [
+        ...prev,
+        ...imported.map((route, i) => ({
+          id: Date.now() + i,
+          color: ROUTE_COLORS[(prev.length + i) % ROUTE_COLORS.length],
+          visible: true,
+          ...route,
+        })),
+      ]);
+      setStatus(`GeoJSON에서 노선 ${imported.length}개를 불러왔습니다.`);
+    } catch (err) {
+      setStatus(`오류: GeoJSON을 읽을 수 없습니다 (${err.message})`);
+    }
   }
 
   function generateAlternativeRoute() {
@@ -288,6 +355,7 @@ export default function App() {
 
   function removeSavedRoute(id) {
     setSavedRoutes((prev) => prev.filter((r) => r.id !== id));
+    setSelectedRouteId((prev) => (prev === id ? null : prev));
   }
 
   function exportRoute(route, format) {
@@ -322,6 +390,10 @@ export default function App() {
           <label className="btn file-btn">
             DEM 업로드
             <input type="file" accept=".tif,.tiff" multiple onChange={handleFileChange} style={{ display: "none" }} />
+          </label>
+          <label className="btn file-btn">
+            GeoJSON 불러오기
+            <input type="file" accept=".geojson,.json" onChange={handleGeoJSONImport} style={{ display: "none" }} />
           </label>
           <span className="status-text">{status}</span>
         </div>
@@ -445,6 +517,9 @@ export default function App() {
                 <span className="dot" style={{ background: BRIDGE_COLOR }} /> 교량
               </span>
             )}
+            {routeResult && getTightCurvePoints(routeResult).length > 0 && (
+              <span>⚠ 급커브(15m 미달)</span>
+            )}
           </div>
         )}
         {savedRoutes.length > 0 && (
@@ -471,8 +546,13 @@ export default function App() {
               <tbody>
                 {savedRoutes.map((route) => {
                   const ew = route.result.earthwork;
+                  const isSelected = route.id === selectedRouteId;
                   return (
-                    <tr key={route.id} style={{ opacity: route.visible ? 1 : 0.4 }}>
+                    <tr
+                      key={route.id}
+                      className={isSelected ? "selected-row" : ""}
+                      style={{ opacity: route.visible ? 1 : 0.4 }}
+                    >
                       <td>
                         <input
                           type="checkbox"
@@ -480,7 +560,11 @@ export default function App() {
                           onChange={() => toggleRouteVisibility(route.id)}
                         />
                       </td>
-                      <td>
+                      <td
+                        className="route-label-cell"
+                        onClick={() => setSelectedRouteId((prev) => (prev === route.id ? null : route.id))}
+                        title="클릭하면 아래에 이 노선의 종단면도가 표시됩니다"
+                      >
                         <span className="dot" style={{ background: route.color }} /> {route.label}
                       </td>
                       <td>{(route.result.length_m / 1000).toFixed(2)}km</td>
@@ -508,17 +592,23 @@ export default function App() {
         )}
       </div>
 
-      {routeResult && (
-        <>
-          <div className="profile-resize-handle" onMouseDown={handleProfileDragStart} />
-          <ElevationProfile
-            lengthM={routeResult.length_m}
-            maxGradePercent={routeResult.max_grade_percent}
-            earthwork={routeResult.earthwork}
-            height={profileHeight}
-          />
-        </>
-      )}
+      {(() => {
+        const selectedRoute = savedRoutes.find((r) => r.id === selectedRouteId);
+        const profileSource = selectedRoute ? selectedRoute.result : routeResult;
+        if (!profileSource) return null;
+        return (
+          <>
+            <div className="profile-resize-handle" onMouseDown={handleProfileDragStart} />
+            <ElevationProfile
+              lengthM={profileSource.length_m}
+              maxGradePercent={profileSource.max_grade_percent}
+              earthwork={profileSource.earthwork}
+              height={profileHeight}
+              label={selectedRoute?.label}
+            />
+          </>
+        );
+      })()}
     </div>
   );
 }
